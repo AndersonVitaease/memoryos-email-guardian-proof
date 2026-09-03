@@ -372,6 +372,69 @@ describe("GC-06 blind fourth-domain validation — OUTBOUND EMAIL / sendMessage"
     expect(provider.sendCalls).toBe(0);
     expect(provider.outbox.length).toBe(0);
   });
+
+  // -------------------------------------------------------------------------
+  // GC-08A — the GC-07R concurrent-duplicate counterexample, now a permanent
+  // regression test: real Promise.all overlap, no artificial interleave.
+  // -------------------------------------------------------------------------
+  it("GC-08A C1 — simultaneous SAME-messageId executions: exactly ONE dispatch, honest loser, no retry", async () => {
+    for (let iteration = 0; iteration < 12; iteration += 1) {
+      const { provider, adapter, intent } = makeWorld();
+
+      const [resultA, resultB] = await Promise.all([
+        executeGuardianIntent(intent, adapter),
+        executeGuardianIntent(intent, adapter),
+      ]);
+
+      // Exactly one execution may reach provider.send; the other dispatches nothing.
+      expect(provider.sendCalls).toBe(1);
+      expect(provider.outbox.length).toBe(1);
+      expect(provider.outbox[0]?.messageId).toBe(intent.messageId);
+
+      const outcomes = [resultA.outcome, resultB.outcome].sort();
+      expect(outcomes).toEqual(["NOT_EXECUTED", "SUCCESS_PROVEN"]);
+
+      const loser = resultA.outcome === "NOT_EXECUTED" ? resultA : resultB;
+      if (loser.outcome !== "NOT_EXECUTED") throw new Error("unreachable");
+      // Zero mutation of its own — proven (dispatched=false, NONE_PROVEN).
+      expect(loser).toEqual({
+        outcome: "NOT_EXECUTED",
+        stage: "COMPATIBILITY",
+        refusal: "BLOCKED",
+        effect: { dispatched: false, state: "NONE_PROVEN" },
+        reasons: ["SIMULTANEOUS_EXECUTION_FOR_SAME_MESSAGE_ID_IN_FLIGHT", intent.messageId],
+      });
+    }
+  });
+
+  it("GC-08A C2 — different messageIds in parallel: independent single-flight, NOT a global lock", async () => {
+    const { provider, adapter } = makeWorld();
+    const intentA: SendMessageIntent = {
+      messageId: "msg-parallel-A",
+      to: "alice@example.test",
+      subject: "Statement A",
+      body: "body A",
+    };
+    const intentB: SendMessageIntent = {
+      messageId: "msg-parallel-B",
+      to: "bob@example.test",
+      subject: "Statement B",
+      body: "body B",
+    };
+
+    const [resultA, resultB] = await Promise.all([
+      executeGuardianIntent(intentA, adapter),
+      executeGuardianIntent(intentB, adapter),
+    ]);
+
+    expect(resultA.outcome).toBe("SUCCESS_PROVEN");
+    expect(resultB.outcome).toBe("SUCCESS_PROVEN");
+    expect(provider.sendCalls).toBe(2);
+    expect(provider.outbox.map((entry) => entry.messageId).sort()).toEqual([
+      "msg-parallel-A",
+      "msg-parallel-B",
+    ]);
+  });
 });
 
 function notExecutedShape(result: unknown, firstReason: string): boolean {

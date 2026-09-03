@@ -24,6 +24,10 @@
  *                      has not already been sent") and refuses with zero
  *                      mutation on mismatch — stale decisions die naturally.
  *  - effect boundary : exactly ONE provider.send call. Nothing else mutates.
+ *  - concurrency     : SAME-INSTANCE single-flight keyed by messageId — two
+ *                      simultaneous executions of the SAME message cannot both
+ *                      dispatch (GC-07R fix). Cross-process coordination is
+ *                      NOT provided (see apply + README).
  *  - postcondition   : the message is durably registered in the provider
  *                      outbox, proven by an independent post-read. Provider
  *                      acceptance alone is never proof.
@@ -122,6 +126,9 @@ export function createEmailGuardianAdapter(
   const now = config.now ?? (() => new Date().toISOString());
   const sendTimeoutMs = config.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS;
 
+  /** Per-messageId single-flight reservation — SAME adapter instance ONLY (see apply). */
+  const inFlightMessageIds = new Set<string>();
+
   /** Bounded wait around the single transport call — the adapter's own machinery. */
   function withTimeout<T>(pending: Promise<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
@@ -202,6 +209,37 @@ export function createEmailGuardianAdapter(
     // apply — the ONLY potentially mutating boundary. Exactly one provider.send.
     // ---------------------------------------------------------------------------
     async apply(proposal: SendMessageProposal): Promise<GuardianResult> {
+      // GC-07R fix — SAME-INSTANCE single-flight keyed by messageId. The
+      // re-prove → send sequence is not atomic with the provider's outbox
+      // registration, so two simultaneous executions of the SAME messageId
+      // could both pass revalidation and both dispatch. The check + add below
+      // are synchronous (no await between) — atomic within this adapter
+      // instance. Different messageIds never contend; there is NO global lock.
+      // Scope: this instance only — no cross-process/machine coordination, no
+      // exactly-once, and a LATER run after an ambiguous outcome (e.g. timeout)
+      // may still dispatch. Provider-native idempotency remains preferable.
+      if (inFlightMessageIds.has(proposal.messageId)) {
+        // Honest loser: this run dispatches nothing — proven (its apply never
+        // invokes provider.send). It reports only what it can prove about its
+        // OWN attempt, never the other execution's success.
+        return {
+          outcome: "NOT_EXECUTED",
+          stage: "COMPATIBILITY",
+          refusal: "BLOCKED",
+          effect: { dispatched: false, state: "NONE_PROVEN" },
+          reasons: ["SIMULTANEOUS_EXECUTION_FOR_SAME_MESSAGE_ID_IN_FLIGHT", proposal.messageId],
+        };
+      }
+      inFlightMessageIds.add(proposal.messageId);
+      try {
+        return await applyGuarded(proposal);
+      } finally {
+        inFlightMessageIds.delete(proposal.messageId);
+      }
+    },
+  };
+
+  async function applyGuarded(proposal: SendMessageProposal): Promise<GuardianResult> {
       // STATE-BOUND EXECUTION: re-prove the bind-time observation against the
       // CURRENT outbox before dispatching anything.
       let current: OutboxMessage | undefined;
@@ -306,6 +344,5 @@ export function createEmailGuardianAdapter(
         effect: { dispatched: true, state: "UNDETERMINED" },
         reasons: ["ACCEPTED_WITHOUT_SUFFICIENT_REGISTRATION_PROOF"],
       };
-    },
-  };
+  }
 }

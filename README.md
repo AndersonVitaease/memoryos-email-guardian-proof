@@ -69,6 +69,26 @@ malformed intents (fail-closed).
 - `CORE_CHANGE_REQUIRED=no` · `ARTIFICIAL_ADAPTATION_REQUIRED=no`
 - `GENERALIZATION_PASS=yes`
 
+## Concurrency (same adapter instance — GC-08A)
+
+1. **Stale decisions** are protected by state re-validation inside `apply`: a
+   decision bound to "messageId absent from outbox" is refused with zero
+   dispatch when the outbox already contains the message.
+2. **Simultaneous same-`messageId` executions** on the same adapter instance
+   are serialized by a per-messageId single-flight reservation: exactly one
+   execution may dispatch; the other returns `NOT_EXECUTED`
+   (`COMPATIBILITY`, zero own dispatch — it never calls `provider.send`).
+3. The reservation is in-memory and **adapter-instance-local**: cross-process
+   and cross-machine coordination are **NOT** provided.
+4. **Exactly-once is NOT guaranteed**: after a crash/restart, after an
+   ambiguous outcome (e.g. timeout after possible dispatch), or across
+   separate adapter instances, a later run may still dispatch the same
+   `messageId`.
+5. **Provider-native idempotency** (atomic accept semantics / idempotency
+   keys) remains the preferable protection when the real backend offers it.
+   Different `messageId`s are never serialized against each other (no global
+   lock).
+
 ## Run
 
 ```bash
