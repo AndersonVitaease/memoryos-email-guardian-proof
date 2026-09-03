@@ -1,0 +1,16 @@
+{
+  "name": "memoryos-email-guardian-proof",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GC-06 blind fourth-domain validation of Guardian Core v0.1 — OUTBOUND EMAIL / sendMessage (deterministic fake provider, no real email).",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}
