@@ -1,98 +1,190 @@
-# memoryos-email-guardian-proof
+# Email Guardian
 
-> GC-06 — **blind fourth-domain validation** of Guardian Core v0.1
-> Domain: **OUTBOUND EMAIL / `sendMessage`** · Date: 2026-09-03
+**Safe email sending for AI agents — bounded authority, stale-state protection, same-instance duplicate suppression, evidence-based outcomes.**
 
-**Blind protocol honored.** The Guardian was understood exclusively from
-`memoryos-guardian-core/src/guardianCore.ts`, `test/guardianCore.test.ts` and
-`README.md`. No adapter source (`filesystemAdapter.ts`, `githubAdapter.ts`,
-`vpsAdapter.ts`) and no prior proof repository were read. The Core was not
-modified, copied or adapted.
+An AI agent may need to send an email. That does not mean it should receive
+unrestricted messaging authority — or that concurrent executions should
+silently send the same message twice.
 
-**Scope:** no Gmail, no SMTP, no network, no real sending. The backend is a
-deterministic in-process fake (`FakeEmailProvider`) whose only mutating
-primitive is `send` and whose read primitive is `findMessage`.
+Email Guardian is an experimental domain proof for **outbound email
+(`sendMessage`)** built on the Guardian model: data-only intents, authority
+closed inside an adapter, decisions revalidated against current state before
+acting, and results that must be **proven**, not assumed.
 
-## Derivation (from the Core alone)
+> Give AI agents capabilities. Not unrestricted authority.
 
-| Core concept | OUTBOUND EMAIL / sendMessage instantiation |
-| --- | --- |
-| Intent (data-only) | `{ messageId, to, subject, body }` — one message; no credential/transport/URL/payload |
-| Authority boundary | Operator-closed: provider + recipient allowlist live inside `createEmailGuardianAdapter`; guardian surface stays `(intent, adapter)` |
-| Eligibility (fail-closed) | Well-formed intent · recipient inside allowlist · messageId not already sent · observation machinery reachable — else `NOT_EXECUTED(ELIGIBILITY)` or `NOT_EXECUTED(OBSERVATION)`, zero dispatch |
-| Relevant state | The provider outbox: "has this messageId already been sent?" |
-| Bound proposal | Frozen decision + observation `{ messageIdAbsentFromOutbox: true, observedAt }`, opaque to the Core |
-| Compatibility check | `apply` re-proves the observation against the **current** outbox; mismatch/unavailable → `NOT_EXECUTED(COMPATIBILITY)`, zero dispatch |
-| Effect boundary | Exactly ONE `provider.send` call — single call site, nothing retries it |
-| Postcondition | Message durably registered in the outbox, proven by an **independent post-read** (acceptance alone is never proof) |
-| Evidence | The outbox entry itself (`providerId`, `queuedAt`, content) |
-| Indeterminate outcome | Acceptance without registration proof · timeout after possible dispatch · unavailable postcondition read — honest `INDETERMINATE`, never promoted |
+**Status: experimental proof — not a production library, not a security
+certification.** The backend is a deterministic in-process fake provider:
+no Gmail, no SMTP, no network, no real sending. No LICENSE file is included
+yet; all rights reserved by the author — public visibility does not make
+this open source.
 
-No fingerprint, SHA, CAS or snapshot hash was invented: none exists naturally
-in email. The state token is the semantic precondition "not already sent",
-re-proven with the domain's own primitive (outbox lookup by messageId).
+## The problem
 
-## Mandatory tests → results (14 passed)
+Sending an email is an **external effect**. Once a message leaves, it cannot
+be treated like a reversible local change: there is no undo, and a duplicate
+is a real, visible event for another person.
 
-| # | Requirement | Result |
-| --- | --- | --- |
-| 1 | Eligible `bind` sends nothing | `BOUND`, `sendCalls=0`, outbox empty, `readCalls=1` |
-| 2 | Recipient outside authority → zero dispatch | `NOT_EXECUTED/ELIGIBILITY/BLOCKED`, `sendCalls=0` |
-| 3 | Bind → state changes → apply | stale decision **naturally blocked**: `NOT_EXECUTED/COMPATIBILITY/BLOCKED`, `dispatched=true, NONE_PROVEN`, `sendCalls=0` |
-| 4 | Valid send → exactly 1 dispatch | `sendCalls=1`, 1 outbox entry, observation chain 3 reads |
-| 5 | Acceptance without proof → never `SUCCESS_PROVEN` | `INDETERMINATE{dispatched=true, UNDETERMINED}` (accept-and-drop) |
-| 6 | Proven postcondition → `SUCCESS_PROVEN` | evidence `outbox-post-read` (providerId, queuedAt, content match) |
-| 7 | Proven-failed postcondition → `FAILURE_PROVEN` | only with definitive provider rejection + corroborating absent post-read; `state=NONE_PROVEN` |
-| 8 | Timeout after possible dispatch → `INDETERMINATE` | Core-native path: `APPLY_FAILED/PROVIDER_SEND_TIMEOUT`, `dispatched=true, UNDETERMINED` |
-| 9 | No automatic retry that could duplicate | timeout / rejection / stale paths: ≤1 send per run, never re-sent |
-| 10 | Caller cannot supply authority | type-level: forbidden fields are compile errors; runtime: `INTENT_CARRIES_FORBIDDEN_AUTHORITY` refused before any provider interaction; surface = `(intent, adapter)`, adapter = `{bind, apply}` only |
+That makes a "simple" send dangerous for an agent:
 
-Supporting: duplicate messageId at bind (BLOCKED), unavailable observation
-(OBSERVATION/UNDETERMINED), postcondition read unavailable (INDETERMINATE),
-malformed intents (fail-closed).
+- The agent **decides** to send message `M` — but between decision and action, state can change: the same message may already have been sent by another run.
+- **Concurrent executions** may arrive: two runs on the same task can both observe "message not yet sent" before either send becomes visible.
+- **Provider acceptance is not the outcome that matters** — a provider can accept a request and still lose, delay or drop the message.
+- **Blindly retrying** after a timeout or unclear error can create a second external effect — a duplicate email — in the name of reliability.
 
-## Refutation attempts
+So the real questions are: how does send authority stay bounded? How do you
+avoid acting on a stale decision? How do two concurrent runs avoid sending
+the same message? And when can you honestly claim "the email was sent"?
 
-| Invariant | Attack attempted | Verdict |
-| --- | --- | --- |
-| 1. NON-EXPANDABLE AUTHORITY | inject credential/transport/providerUrl/providerPayload via intent (type + runtime); smuggle authority through the guardian surface | **SUPPORTED** — types cannot express it; runtime bind refuses before any provider interaction; surface is structurally `(intent, adapter)` |
-| 2. FAIL-CLOSED ELIGIBILITY | malformed intent, out-of-scope recipient, already-sent messageId, dead observation | **SUPPORTED** — every path terminates `NOT_EXECUTED`, `dispatched=false`, `sendCalls=0`; `apply` reachable only after `BOUND` |
-| 3. STATE-BOUND EXECUTION | invalidate the bind decision between bind and apply (concurrent send of the same messageId); re-proof machinery unavailable | **SUPPORTED** — apply re-proves the observation against current state and refuses with zero mutation; unavailable re-proof also refuses (no blind send) |
-| 4. INTENT-CONFINED CONTROLLED EFFECTS | find any second mutating path or caller machinery | **SUPPORTED** — exactly one `provider.send` call site; no caller machinery exists anywhere on the surface |
-| 5. EPISTEMIC HONESTY WITH INDETERMINACY | acceptance without registration; timeout after dispatch; unreadable postcondition | **SUPPORTED** — all remain `INDETERMINATE` (never `SUCCESS_PROVEN`, never fabricated `NONE_PROVEN` after dispatch); `FAILURE_PROVEN` only on definitive, corroborated rejection |
+## What Email Guardian does
 
-## Verdict
+Every execution follows the same guarded flow:
 
-- `STATE_BOUND_EXECUTION_NATURAL=yes` — the stale decision dies by a natural
-  domain precondition ("this message has not already been sent"), re-proven
-  inside the controlled operation; nothing was imported from other domains.
-- `CORE_CHANGE_REQUIRED=no` · `ARTIFICIAL_ADAPTATION_REQUIRED=no`
-- `GENERALIZATION_PASS=yes`
+```
+Intent
+→ Bound authority
+→ Observe relevant outbox state
+→ Fresh compatibility check
+→ Same-instance keyed reservation
+→ Controlled send
+→ Independent post-read
+→ Evidence-based result
+```
 
-## Concurrency (same adapter instance — GC-08A)
+- **Intent** — data-only: `{ messageId, to, subject, body }`. Credentials, transports, provider URLs and raw payloads are structurally inexpressible on the intent — and refused at runtime if smuggled in.
+- **Bound authority** — the provider and the recipient allowlist are closed inside the adapter by the operator. The caller receives no provider credentials and no arbitrary transport; the guardian surface stays exactly `(intent, adapter)`.
+- **Observe relevant outbox state** — the domain's natural state question: *"has this `messageId` already been sent?"*, answered by an outbox lookup. No fingerprints, SHAs or snapshot hashes are invented here.
+- **Fresh compatibility check** — inside the controlled operation, the bind-time observation is re-proven against the **current** outbox. If the state moved, the stale decision dies with zero dispatch; if re-proof is unavailable, the send is refused — no blind send.
+- **Same-instance keyed reservation** — a per-`messageId` single-flight reservation closes the simultaneous-decision window (see below).
+- **Controlled send** — exactly **one** `provider.send` call site exists; nothing retries it.
+- **Independent post-read** — success is established by reading the outbox back and matching the registered message against what was sent.
+- **Evidence-based result** — `SUCCESS_PROVEN`, `FAILURE_PROVEN`, `NOT_EXECUTED` (refused, with stage and reasons) or `INDETERMINATE` (e.g. acceptance without registration proof, timeout after a possible dispatch). Ambiguous outcomes are reported honestly, never promoted.
 
-1. **Stale decisions** are protected by state re-validation inside `apply`: a
-   decision bound to "messageId absent from outbox" is refused with zero
-   dispatch when the outbox already contains the message.
-2. **Simultaneous same-`messageId` executions** on the same adapter instance
-   are serialized by a per-messageId single-flight reservation: exactly one
-   execution may dispatch; the other returns `NOT_EXECUTED`
-   (`COMPATIBILITY`, zero own dispatch — it never calls `provider.send`).
-3. The reservation is in-memory and **adapter-instance-local**: cross-process
-   and cross-machine coordination are **NOT** provided.
-4. **Exactly-once is NOT guaranteed**: after a crash/restart, after an
-   ambiguous outcome (e.g. timeout after possible dispatch), or across
-   separate adapter instances, a later run may still dispatch the same
-   `messageId`.
-5. **Provider-native idempotency** (atomic accept semantics / idempotency
-   keys) remains the preferable protection when the real backend offers it.
-   Different `messageId`s are never serialized against each other (no global
-   lock).
+These steps are coordinated pieces, not one atomically unified transaction — their honest composition is the point.
 
-## Run
+## Concurrent duplicate example
+
+This failure was found by an external red-team pass against this proof.
+Before the fix, two executions of the same message could both send.
+
+**Before — two simultaneous calls, same `messageId`:** run A observes the
+outbox: message absent. Run B observes it too: also absent — A's send is not
+visible yet. Both pass their fresh compatibility checks, each against
+genuinely current state. Both send: `sendCalls=2`, two outbox entries — and
+**both executions reported success**.
+
+Each run did nothing wrong individually: each revalidated state immediately
+before acting. The race lives in the gap between revalidation and send —
+fresh revalidation alone does not close the simultaneous-decision window.
+
+**After (GC-08A) — same adapter instance, same `messageId`:**
+
+1. The adapter holds a same-instance, in-memory reservation keyed by `messageId`; acquiring it is a synchronous *check + add* before the first `await` — atomic within the adapter instance.
+2. Exactly one execution crosses the send; the other is refused before dispatching anything (`NOT_EXECUTED`, zero send of its own).
+3. Result: `sendCalls=1`, `outbox=1` — one `SUCCESS_PROVEN`, one refusal.
+4. The reservation is released in a `finally` block, so it never leaks — not on success, not on failure, not on refusal.
+
+An additional attack — 10 simultaneous executions of the same `messageId` —
+produced **exactly one** send crossing the boundary in the tested scope.
+
+**This protection is same-instance only**: an in-memory reservation inside
+one adapter instance — not a cross-process or cross-machine lock.
+
+## Different messages remain concurrent
+
+The reservation is *keyed* by `messageId`, so it serializes only what it
+should: messages A, B and C proceed independently and in parallel; two
+simultaneous executions of message A contend with each other — and only with
+each other. There is **no global mutex**: closing the duplicate-send window
+did not serialize all email sending.
+
+## Success is evidence, not provider acceptance
+
+A provider accepting a request is not the postcondition. In this proof:
+
+- acceptance is followed by an **independent post-read** of the outbox;
+- `SUCCESS_PROVEN` requires the outbox to contain the message matching the expected content and provider id;
+- acceptance **without** registration proof stays `INDETERMINATE` (`UNDETERMINED`) — never promoted to success;
+- a definitive, corroborated provider rejection is `FAILURE_PROVEN` (`state=NONE_PROVEN`);
+- a timeout after a possible dispatch stays `INDETERMINATE` — the proof never guesses, never fabricates, and never auto-retries in a way that could duplicate.
+
+## What was tested
+
+16/16 tests pass and `typecheck` passes at the validated commit (the
+original 14 requirements plus 2 concurrency-hardening tests). This is
+evidence about tested paths — not a benchmark and not a universal safety
+claim.
+
+- **Stale sequential protection** — a decision bound to "message absent" is refused with zero dispatch when the outbox already contains it.
+- **Same-instance same-message suppression** — two simultaneous executions of one `messageId`: `sendCalls=1`, `outbox=1`, honest loser.
+- **10 simultaneous same-ID attack** — exactly 1 crosses the send.
+- **Different IDs remain parallel** — the reservation is not a global lock.
+- **Reservation release** — released in `finally`; nothing leaks.
+- **Independent post-read** — acceptance alone is never success.
+- **Fail-closed eligibility** — malformed intents, out-of-scope recipients, already-sent `messageId`s and unavailable observation machinery all refuse with zero dispatch.
+- **Authority confinement** — forbidden intent fields (credential, transport, provider URL, raw payload) are compile errors and runtime refusals.
+- **Fake provider / no real network** — a deterministic in-process provider is the only backend; no real email is ever sent.
 
 ```bash
 npm install
-npm test         # 14 tests
+npm test         # 16 tests
 npm run typecheck
 ```
+
+## Relationship to Guardian Core
+
+Email Guardian was created as a **blind, independent fourth-domain proof**
+of the Guardian Core model: the domain (outbound email) was chosen after the
+Core was frozen, and the adapter was derived only from the Core's public
+sources — without reading the other domain adapters. The Core itself was not
+modified.
+
+- [Guardian Core](https://github.com/AndersonVitaease/memoryos-guardian-core) — the domain-agnostic Safe Execution Core (bind → gate → apply, fail-closed) that this proof instantiates.
+
+The email red-team also surfaced a lesson for the wider Guardian work:
+**per-execution fresh revalidation does not by itself imply cross-execution
+serialization**. The proof passed all of its sequential state-bound tests and
+still allowed a simultaneous duplicate; the same-instance keyed reservation
+(GC-08A) was added afterwards to close that window within one adapter
+instance.
+
+## Limitations
+
+This is an experimental proof. Explicitly, it does **not** provide:
+
+- production certification of any kind;
+- real email delivery — the only backend is a fake provider, with no real email network;
+- a fully bound email state — `EMAIL_STATE_BOUND` remains **PARTIAL**;
+- cross-process protection — the reservation is same-instance only;
+- cross-machine protection or any distributed lock;
+- provider-native idempotency (idempotency keys, atomic accept) — when a real backend offers such primitives, they are the stronger protection;
+- exactly-once delivery — not guaranteed, in any configuration;
+- crash/restart safety for the reservation — a crash or restart can invalidate local reservation assumptions, and a later run may dispatch the same `messageId` again;
+- resolution of ambiguous provider outcomes — acceptance-without-proof and timeout-after-possible-dispatch remain `INDETERMINATE`;
+- protection against a malicious adapter implementation — the model assumes the adapter honors its contract;
+- claims beyond the tested outbound email path — the evidence applies to what the tests actually exercise.
+
+A known result-mapping deviation is documented in the next section.
+
+## Known conformance note
+
+Guardian Core later standardized `dispatched` to mean **"the Core invoked
+`adapter.apply`"** — not "the external effect occurred"; the occurrence state
+field carries the truth about the effect. In this independent proof, the
+losing execution of the GC-08A concurrent race still reports
+`dispatched=false` / `NONE_PROVEN`, even though its refusal happens inside
+`apply`. Under the later Core vocabulary, the semantically aligned value
+would be `dispatched=true` / `NONE_PROVEN`.
+
+To be explicit: this is a mapping/vocabulary divergence, not a send — the
+refused execution performs **zero** email send, and the same-instance
+duplicate-suppression evidence is unaffected. The code is intentionally left
+unchanged to preserve the validated proof state; alignment with the later
+Core semantics is deferred.
+
+## Guardian ecosystem
+
+- [Guardian Core](https://github.com/AndersonVitaease/memoryos-guardian-core) — domain-agnostic Safe Execution Core (bind → gate → apply, fail-closed).
+- [VPS Guardian](https://github.com/AndersonVitaease/memoryos-vps-guardian-pro) — governed VPS/Dokploy application redeploy with supervised rollback evidence.
+- [GitHub Guardian](https://github.com/AndersonVitaease/memoryos-github-guardian-proof) — state-bound PR merge execution using GitHub's native SHA precondition and independent post-merge verification.
+- [Filesystem Guardian](https://github.com/AndersonVitaease/memoryos-filesystem-guardian-proof) — stale-state-safe file changes with bounded filesystem authority and read-back verification.
